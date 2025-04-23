@@ -23,6 +23,10 @@ struct Args {
     #[clap(long, env = "ARANGODB_PASSWORD")]
     password: String,
 
+    /// Prefix for database names
+    #[clap(long, default_value = "test_db")]
+    prefix: String,
+
     /// Number of parallel worker threads for UPSERT operations
     #[clap(long, default_value = "10")]
     worker_threads: usize,
@@ -32,20 +36,22 @@ struct ArangoClient {
     endpoints: Vec<String>,
     username: String,
     password: String,
+    prefix: String,
     client: reqwest::Client,
 }
 
 impl ArangoClient {
-    fn new(endpoints: Vec<String>, username: String, password: String) -> Self {
+    fn new(endpoints: Vec<String>, username: String, password: String, prefix: String) -> Self {
         let client = reqwest::Client::new();
         Self {
             endpoints,
             username,
             password,
+            prefix,
             client,
         }
     }
-    
+
     fn get_random_endpoint(&self) -> &str {
         let idx = rand::thread_rng().gen_range(0..self.endpoints.len());
         &self.endpoints[idx]
@@ -54,7 +60,10 @@ impl ArangoClient {
     async fn upsert_operation(&self, worker_id: usize) -> Result<()> {
         // This is a placeholder for the actual UPSERT operation
         let endpoint = self.get_random_endpoint();
-        info!("Worker {}: Performing UPSERT operation on endpoint {}", worker_id, endpoint);
+        info!(
+            "Worker {}: Performing UPSERT operation on endpoint {}",
+            worker_id, endpoint
+        );
         // Simulate work
         sleep(Duration::from_secs(1)).await;
         Ok(())
@@ -63,8 +72,11 @@ impl ArangoClient {
     async fn create_database(&self) -> Result<String> {
         // This is a placeholder for the actual database creation
         let endpoint = self.get_random_endpoint();
-        let db_name = format!("test_db_{}", rand::thread_rng().gen::<u32>());
-        info!("DB Manager: Creating database '{}' on endpoint {}", db_name, endpoint);
+        let db_name = format!("{}_{}", self.prefix, rand::thread_rng().gen::<u32>());
+        info!(
+            "DB Manager: Creating database '{}' on endpoint {}",
+            db_name, endpoint
+        );
         // Simulate work
         sleep(Duration::from_secs(1)).await;
         Ok(db_name)
@@ -73,7 +85,10 @@ impl ArangoClient {
     async fn drop_database(&self, db_name: &str) -> Result<()> {
         // This is a placeholder for the actual database dropping
         let endpoint = self.get_random_endpoint();
-        info!("DB Manager: Dropping database '{}' on endpoint {}", db_name, endpoint);
+        info!(
+            "DB Manager: Dropping database '{}' on endpoint {}",
+            db_name, endpoint
+        );
         // Simulate work
         sleep(Duration::from_secs(1)).await;
         Ok(())
@@ -88,7 +103,7 @@ async fn run_worker(client: Arc<ArangoClient>, worker_id: usize) -> Result<()> {
 }
 
 async fn run_db_manager(client: Arc<ArangoClient>) -> Result<()> {
-    let max_dbs = 5;
+    let max_dbs = 10;
     let mut active_dbs = Vec::new();
 
     loop {
@@ -119,11 +134,13 @@ async fn main() -> Result<()> {
     info!("Starting ArangoDB UPSERT tester");
     info!("ArangoDB Endpoints: {}", args.endpoints.join(", "));
     info!("Worker Threads: {}", args.worker_threads);
+    info!("Database Prefix: {}", args.prefix);
 
     let client = Arc::new(ArangoClient::new(
         args.endpoints,
         args.username,
         args.password,
+        args.prefix,
     ));
 
     // Spawn worker tasks
@@ -156,4 +173,3 @@ async fn main() -> Result<()> {
 
     Ok(())
 }
-
