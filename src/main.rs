@@ -11,9 +11,13 @@ use tokio::time::sleep;
 #[derive(Parser, Debug)]
 #[clap(author, version, about)]
 struct Args {
-    /// ArangoDB endpoint URLs
+    /// ArangoDB endpoint URLs for workers
     #[clap(long, env = "ARANGODB_URL", value_delimiter = ',')]
     endpoints: Vec<String>,
+
+    /// ArangoDB endpoint URL for database manager (optional)
+    #[clap(long, env = "ARANGODB_DB_MANAGER_URL")]
+    db_manager_endpoint: Option<String>,
 
     /// ArangoDB username
     #[clap(long, env = "ARANGODB_USER")]
@@ -28,16 +32,17 @@ struct Args {
     prefix: String,
 
     /// Number of parallel worker threads for UPSERT operations
-    #[clap(long, default_value = "10")]
-    worker_threads: usize,
-    
-    /// Sleep time for database manager task in milliseconds
     #[clap(long, default_value = "100")]
+    worker_threads: usize,
+
+    /// Sleep time for database manager task in milliseconds
+    #[clap(long, default_value = "10")]
     db_sleep_ms: u64,
 }
 
 struct ArangoClient {
     endpoints: Vec<String>,
+    db_manager_endpoint: Option<String>,
     username: String,
     password: String,
     prefix: String,
@@ -45,10 +50,17 @@ struct ArangoClient {
 }
 
 impl ArangoClient {
-    fn new(endpoints: Vec<String>, username: String, password: String, prefix: String) -> Self {
+    fn new(
+        endpoints: Vec<String>,
+        db_manager_endpoint: Option<String>,
+        username: String,
+        password: String,
+        prefix: String,
+    ) -> Self {
         let client = reqwest::Client::new();
         Self {
             endpoints,
+            db_manager_endpoint,
             username,
             password,
             prefix,
@@ -82,29 +94,36 @@ impl ArangoClient {
         };
 
         let endpoint = self.get_random_endpoint();
-        
+
         // Choose a random collection (c1-c5)
         let coll_num = rand::thread_rng().gen_range(1..=5);
         let collection_name = format!("c{}", coll_num);
-        
+
         info!(
             "Worker {}: Performing UPSERT operation on database '{}', collection '{}' at endpoint {}",
             worker_id, db_name, collection_name, endpoint
         );
-        
+
         // Build URL for cursor API
         let url = format!("{}/_db/{}/_api/cursor", endpoint, db_name);
-        
+
         // Build the AQL query with bindVars
         let query_body = serde_json::json!({
-            "query": "FOR i IN 1..10 LET key = TO_STRING(FLOOR(RAND()*1000)) UPSERT {_key:key} INSERT {_key:key, value: FLOOR(RAND()*1000000), Hallo: i, date: DATE_NOW()} UPDATE {_value: FLOOR(RAND() * 1000000), Hallo: i, date: DATE_NOW()} IN @@col",
+            "query": "FOR i IN 1..10
+                      LET key = TO_STRING(FLOOR(RAND()*10000)) 
+                      UPSERT {_key:key} 
+                      INSERT {_key:key, value: FLOOR(RAND()*1000000), 
+                              Hallo: i, date: DATE_NOW(), s: SLEEP(0.1)} 
+                      UPDATE {value: FLOOR(RAND() * 1000000), Hallo: i, 
+                              date: DATE_NOW(), s: SLEEP(0.1)} IN @@col",
             "bindVars": {
                 "@col": collection_name
             }
         });
-        
+
         // Make the POST request with timeout
-        match self.client
+        match self
+            .client
             .post(&url)
             .basic_auth(&self.username, Some(&self.password))
             .json(&query_body)
@@ -125,7 +144,7 @@ impl ArangoClient {
                         worker_id, db_name, collection_name
                     );
                 }
-            },
+            }
             Err(e) => {
                 // Request failed (e.g., timeout, connection error)
                 info!(
@@ -134,60 +153,74 @@ impl ArangoClient {
                 );
             }
         }
-        
+
         Ok(())
     }
 
+    fn get_db_manager_endpoint(&self) -> &str {
+        match &self.db_manager_endpoint {
+            Some(endpoint) => endpoint,
+            None => self.get_random_endpoint(),
+        }
+    }
+
     async fn create_database(&self) -> Result<String> {
-        let endpoint = self.get_random_endpoint();
+        let endpoint = self.get_db_manager_endpoint();
         let db_name = format!("{}_{}", self.prefix, rand::thread_rng().gen::<u32>());
         info!(
             "DB Manager: Creating database '{}' on endpoint {}",
             db_name, endpoint
         );
-        
+
         // Create database with single shard
         let url = format!("{}{}", endpoint, "/_api/database");
         let json_body = serde_json::json!({
             "name": db_name,
             "sharding": "single"
         });
-        
+
         // Make the POST request with 60 second timeout
-        let result = self.client
+        let result = self
+            .client
             .post(&url)
             .basic_auth(&self.username, Some(&self.password))
             .json(&json_body)
             .timeout(Duration::from_secs(60))
             .send()
             .await;
-            
+
         match result {
             Ok(response) => {
                 if response.status() != 201 {
                     // Request completed but with wrong status code
                     info!(
                         "DB Manager: Failed to create database '{}': HTTP status {}",
-                        db_name, response.status()
+                        db_name,
+                        response.status()
                     );
-                    return Err(anyhow::anyhow!("Failed to create database: HTTP status {}", response.status()));
+                    return Err(anyhow::anyhow!(
+                        "Failed to create database: HTTP status {}",
+                        response.status()
+                    ));
                 }
-                
+
                 // Create collections c1 through c5
                 for i in 1..=5 {
                     let collection_name = format!("c{}", i);
-                    let coll_url = format!("{}{}{}{}", endpoint, "/_db/", db_name, "/_api/collection");
+                    let coll_url =
+                        format!("{}{}{}{}", endpoint, "/_db/", db_name, "/_api/collection");
                     let coll_body = serde_json::json!({
                         "name": collection_name
                     });
-                    
-                    match self.client
+
+                    match self
+                        .client
                         .post(&coll_url)
                         .basic_auth(&self.username, Some(&self.password))
                         .json(&coll_body)
                         .timeout(Duration::from_secs(60))
                         .send()
-                        .await 
+                        .await
                     {
                         Ok(coll_response) => {
                             if coll_response.status() != 200 && coll_response.status() != 201 {
@@ -201,7 +234,7 @@ impl ArangoClient {
                                     collection_name, db_name
                                 );
                             }
-                        },
+                        }
                         Err(e) => {
                             info!(
                                 "DB Manager: Failed to create collection '{}' in database '{}': {}",
@@ -210,33 +243,31 @@ impl ArangoClient {
                         }
                     }
                 }
-                
+
                 // Database created successfully
                 Ok(db_name)
-            },
+            }
             Err(e) => {
                 // Request failed (e.g., timeout, connection error)
-                info!(
-                    "DB Manager: Failed to create database '{}': {}",
-                    db_name, e
-                );
+                info!("DB Manager: Failed to create database '{}': {}", db_name, e);
                 Err(anyhow::anyhow!("Failed to create database: {}", e))
             }
         }
     }
 
     async fn drop_database(&self, db_name: &str) -> Result<()> {
-        let endpoint = self.get_random_endpoint();
+        let endpoint = self.get_db_manager_endpoint();
         info!(
             "DB Manager: Dropping database '{}' on endpoint {}",
             db_name, endpoint
         );
-        
+
         // Build URL for database deletion
         let url = format!("{}/_api/database/{}", endpoint, db_name);
-        
+
         // Make the DELETE request with 60 second timeout
-        match self.client
+        match self
+            .client
             .delete(&url)
             .basic_auth(&self.username, Some(&self.password))
             .timeout(Duration::from_secs(60))
@@ -248,21 +279,19 @@ impl ArangoClient {
                     // Request completed but with wrong status code
                     info!(
                         "DB Manager: Failed to drop database '{}': HTTP status {}",
-                        db_name, response.status()
+                        db_name,
+                        response.status()
                     );
                     // Assume database is still there and continue
                     return Ok(());
                 }
-                
+
                 info!("DB Manager: Successfully dropped database '{}'", db_name);
                 Ok(())
-            },
+            }
             Err(e) => {
                 // Request failed (e.g., timeout, connection error)
-                info!(
-                    "DB Manager: Failed to drop database '{}': {}",
-                    db_name, e
-                );
+                info!("DB Manager: Failed to drop database '{}': {}", db_name, e);
                 // Assume database is still there and continue
                 Ok(())
             }
@@ -295,27 +324,32 @@ async fn run_db_manager(
     let mut created_count = 0;
     let mut attempts = 0;
     let max_attempts = min_dbs * 2; // Allow some failures
-    
+
     while created_count < min_dbs && attempts < max_attempts {
         match client.create_database().await {
             Ok(db_name) => {
+                info!("Getting write lock...");
                 let mut dbs = active_dbs.write().unwrap();
+                info!("Got it!");
                 dbs.push(db_name);
                 created_count += 1;
                 info!("DB Manager: Created initial database, total: {}", dbs.len());
-            },
+            }
             Err(e) => {
                 info!("DB Manager: Failed to create initial database: {}", e);
             }
         }
         attempts += 1;
     }
-    
+
     if created_count < min_dbs {
-        return Err(anyhow::anyhow!("Failed to create the minimum required databases"));
+        return Err(anyhow::anyhow!(
+            "Failed to create the minimum required databases"
+        ));
     }
 
     loop {
+        info!("Loop of db manager");
         // Randomly create or drop databases
         let rand_val = rand::thread_rng().gen_range(0..=100);
         let should_create;
@@ -343,7 +377,7 @@ async fn run_db_manager(
                         dbs.push(db_name);
                         info!("DB Manager: Active databases: {}", dbs.len());
                     }
-                },
+                }
                 Err(e) => {
                     // Just log the error but continue operation
                     info!("DB Manager: Database creation failed: {}", e);
@@ -368,18 +402,24 @@ async fn run_db_manager(
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .format_timestamp(None)
+        .format_timestamp(Some(env_logger::TimestampPrecision::Millis))
         .init();
     let args = Args::parse();
 
     info!("Starting ArangoDB UPSERT tester");
-    info!("ArangoDB Endpoints: {}", args.endpoints.join(", "));
+    info!("ArangoDB Worker Endpoints: {}", args.endpoints.join(", "));
+    if let Some(db_endpoint) = &args.db_manager_endpoint {
+        info!("ArangoDB DB Manager Endpoint: {}", db_endpoint);
+    } else {
+        info!("ArangoDB DB Manager Endpoint: Using worker endpoints");
+    }
     info!("Worker Threads: {}", args.worker_threads);
     info!("Database Prefix: {}", args.prefix);
     info!("DB Manager Sleep: {}ms", args.db_sleep_ms);
 
     let client = Arc::new(ArangoClient::new(
         args.endpoints,
+        args.db_manager_endpoint,
         args.username,
         args.password,
         args.prefix,
@@ -401,12 +441,22 @@ async fn main() -> Result<()> {
         worker_handles.push(handle);
     }
 
-    // Spawn database manager task
+    // Create a separate runtime for the database manager with a single thread
+    let db_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("Failed to build database manager runtime")?;
+
+    // Spawn database manager task on separate runtime
     let db_manager_client = Arc::clone(&client);
     let db_manager_dbs = Arc::clone(&active_dbs);
     let db_sleep_ms = args.db_sleep_ms;
-    let db_manager_handle = tokio::spawn(async move {
-        if let Err(e) = run_db_manager(db_manager_client, db_manager_dbs, db_sleep_ms).await {
+    let db_manager_handle = std::thread::spawn(move || {
+        if let Err(e) = db_rt.block_on(run_db_manager(
+            db_manager_client,
+            db_manager_dbs,
+            db_sleep_ms,
+        )) {
             eprintln!("Database manager error: {}", e);
         }
     });
@@ -415,9 +465,10 @@ async fn main() -> Result<()> {
     for (i, handle) in worker_handles.into_iter().enumerate() {
         handle.await.context(format!("Worker {} task failed", i))?;
     }
+    // Handle thread join result differently since it's not a standard Result
     db_manager_handle
-        .await
-        .context("Database manager task failed")?;
+        .join()
+        .map_err(|_| anyhow::anyhow!("Database manager thread failed"))?;
 
     Ok(())
 }
